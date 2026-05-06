@@ -107,17 +107,9 @@ static void _gopy_clear_go_tls(void) {
 */
 import "C"
 import (
-	"runtime"
 	"github.com/go-python/gopy/gopyh" // handler
 	%[6]s
 )
-
-// init enforces GOMAXPROCS=1 as a belt-and-suspenders measure: the Python wrapper
-// also sets the GOMAXPROCS env var before dlopen, but calling it here guarantees
-// the limit even if the extension is loaded without the wrapper (issue #370).
-func init() {
-	runtime.GOMAXPROCS(1)
-}
 
 // main doesn't do anything in lib / pkg mode, but is essential for exe mode
 func main() {
@@ -307,31 +299,9 @@ cwd = os.getcwd()
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 os.chdir(currentdir)
 # When multiple gopy extensions coexist in one Python process each carries its own
-# independent Go runtime. Three environment variables must be set *before* dlopen
-# so the Go runtime reads them during its __attribute__((constructor)):
-#
-# GOGC=off       – disables automatic GC in this extension's runtime (issue #370).
-#                  Root cause: exitsyscall()'s fast path does not call
-#                  prepareForSweep(), so if the GC advances mheap_.sweepgen while
-#                  the cgo goroutine is parked between calls, the cached span has
-#                  a stale sweepgen and the next refill() check panics. Disabling
-#                  GC prevents sweepgen from ever advancing. Memory held by Go
-#                  objects in this extension accumulates until the process exits;
-#                  set GOGC=100 before importing to re-enable GC if your workload
-#                  manages object lifetimes carefully.
-# GOMAXPROCS=1   – limits each runtime to one OS-level P, reducing the window in
-#                  which background goroutines from different runtimes overlap.
-# asyncpreemptoff=1 – disables SIGURG-based goroutine preemption so the second
-#                  runtime's signal handler cannot fire inside the first's goroutine.
-if 'GOGC' not in os.environ:
-	os.environ['GOGC'] = 'off'
-if 'GOMAXPROCS' not in os.environ:
-	os.environ['GOMAXPROCS'] = '1'
-_gopy_godebug = os.environ.get('GODEBUG', '')
-if 'asyncpreemptoff' not in _gopy_godebug:
-	_gopy_godebug = (_gopy_godebug + ',asyncpreemptoff=1').lstrip(',')
-os.environ['GODEBUG'] = _gopy_godebug
-del _gopy_godebug
+# independent Go runtime. The Go extension is loaded without RTLD_GLOBAL below, and
+# _gopy_clear_go_tls() is called before each CGo entry to force needm() to run, which
+# establishes the correct per-extension M/P/mcache context (issue #370).
 # Also load the extension without RTLD_GLOBAL so that Go runtime symbols stay
 # local to each .so — belt-and-suspenders on platforms where RTLD_GLOBAL is the
 # Python default (e.g. some Linux builds).
