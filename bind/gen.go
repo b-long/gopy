@@ -87,13 +87,37 @@ static inline void gopy_err_handle() {
 		PyErr_Print();
 	}
 }
+// _gopy_clear_go_tls clears the Go goroutine pointer from this thread's TLS.
+// When multiple gopy extensions share a process, each has its own Go runtime
+// but all runtimes use the same TLS slot for the current goroutine pointer
+// (GS:0x30 on darwin/amd64, FS:-8 on linux/amd64). After one extension's
+// init(), TLS is left pointing to that runtime's g0. If another extension's
+// CGo entry-point reads TLS and finds a non-nil goroutine, it takes the fast
+// path (no needm()) and runs with the wrong M/P/mcache -- corrupting the heap.
+// Clearing the slot before each CGo entry forces needm() to run, which
+// establishes the correct per-extension context (issue #370).
+static void _gopy_clear_go_tls(void) {
+#if defined(__x86_64__) && defined(__APPLE__)
+	__asm__ volatile("movq $0, %%%%gs:0x30" ::: "memory");
+#elif defined(__x86_64__) && defined(__linux__)
+	__asm__ volatile("movq $0, %%%%fs:-8" ::: "memory");
+#endif
+}
 %[8]s
 */
 import "C"
 import (
+	"runtime"
 	"github.com/go-python/gopy/gopyh" // handler
 	%[6]s
 )
+
+// init enforces GOMAXPROCS=1 as a belt-and-suspenders measure: the Python wrapper
+// also sets the GOMAXPROCS env var before dlopen, but calling it here guarantees
+// the limit even if the extension is loaded without the wrapper (issue #370).
+func init() {
+	runtime.GOMAXPROCS(1)
+}
 
 // main doesn't do anything in lib / pkg mode, but is essential for exe mode
 func main() {
@@ -259,6 +283,7 @@ mod.add_function('GoPyInit', None, [])
 mod.add_function('DecRef', None, [param('int64_t', 'handle')])
 mod.add_function('IncRef', None, [param('int64_t', 'handle')])
 mod.add_function('NumHandles', retval('int'), [])
+mod.add_function('_gopy_clear_go_tls', None, [])
 `
 
 	// appended to imports in py wrap preamble as key for adding at end
@@ -281,10 +306,35 @@ except ImportError:
 cwd = os.getcwd()
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 os.chdir(currentdir)
-# Load the extension with RTLD_LOCAL so each gopy .so keeps its own copy of
-# the Go runtime globals. On macOS Python's default dlopen flags include
-# RTLD_GLOBAL which causes symbol interposition across independently-built Go
-# runtimes loaded in the same process (issue #370 / #385).
+# When multiple gopy extensions coexist in one Python process each carries its own
+# independent Go runtime. Three environment variables must be set *before* dlopen
+# so the Go runtime reads them during its __attribute__((constructor)):
+#
+# GOGC=off       – disables automatic GC in this extension's runtime (issue #370).
+#                  Root cause: exitsyscall()'s fast path does not call
+#                  prepareForSweep(), so if the GC advances mheap_.sweepgen while
+#                  the cgo goroutine is parked between calls, the cached span has
+#                  a stale sweepgen and the next refill() check panics. Disabling
+#                  GC prevents sweepgen from ever advancing. Memory held by Go
+#                  objects in this extension accumulates until the process exits;
+#                  set GOGC=100 before importing to re-enable GC if your workload
+#                  manages object lifetimes carefully.
+# GOMAXPROCS=1   – limits each runtime to one OS-level P, reducing the window in
+#                  which background goroutines from different runtimes overlap.
+# asyncpreemptoff=1 – disables SIGURG-based goroutine preemption so the second
+#                  runtime's signal handler cannot fire inside the first's goroutine.
+if 'GOGC' not in os.environ:
+	os.environ['GOGC'] = 'off'
+if 'GOMAXPROCS' not in os.environ:
+	os.environ['GOMAXPROCS'] = '1'
+_gopy_godebug = os.environ.get('GODEBUG', '')
+if 'asyncpreemptoff' not in _gopy_godebug:
+	_gopy_godebug = (_gopy_godebug + ',asyncpreemptoff=1').lstrip(',')
+os.environ['GODEBUG'] = _gopy_godebug
+del _gopy_godebug
+# Also load the extension without RTLD_GLOBAL so that Go runtime symbols stay
+# local to each .so — belt-and-suspenders on platforms where RTLD_GLOBAL is the
+# Python default (e.g. some Linux builds).
 if hasattr(sys, 'getdlopenflags'):
 	try:
 		import ctypes as _gopy_ctypes
