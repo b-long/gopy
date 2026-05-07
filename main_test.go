@@ -768,14 +768,14 @@ OK
 
 func TestCStrings(t *testing.T) {
 	// t.Parallel()
-	if runtime.GOOS == "darwin" {
-		// On macOS, ru_maxrss is in bytes and the GC behaviour under the
-		// needm/dropm per-call cycle (required by the multi-extension TLS
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
+		// On darwin/amd64, ru_maxrss is in bytes and the GC behaviour under
+		// the needm/dropm per-call cycle (required by the multi-extension TLS
 		// fix for issue #370) means Go allocations are not reclaimed fast
 		// enough for the leak threshold used by this test.  CI runs on
 		// Linux/Windows where ru_maxrss is in KB, making the threshold
 		// unreachable, so the test is meaningful only there.
-		t.Skip("TestCStrings: unreliable on macOS due to maxrss semantics and multi-extension GC trade-off (issue #370)")
+		t.Skip("TestCStrings: unreliable on darwin/amd64 due to maxrss semantics and multi-extension GC trade-off (issue #370)")
 	}
 	path := "_examples/cstrings"
 	testPkg(t, pkg{
