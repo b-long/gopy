@@ -107,6 +107,7 @@ static void _gopy_clear_go_tls(void) {
 */
 import "C"
 import (
+	"runtime"
 	"github.com/go-python/gopy/gopyh" // handler
 	%[6]s
 )
@@ -146,6 +147,15 @@ func IncRef(handle CGoHandle) {
 //export NumHandles
 func NumHandles() int {
 	return gopyh.NumHandles()
+}
+
+// RunGC runs the Go garbage collector.  gopy registers this as a Python
+// gc.callbacks handler so it fires automatically after each Python GC cycle,
+// keeping Go-heap objects freed via DecRef actually collected without any
+// user intervention.
+//export RunGC
+func RunGC() {
+	runtime.GC()
 }
 
 // boolGoToPy converts a Go bool to python-compatible C.char
@@ -275,6 +285,7 @@ mod.add_function('GoPyInit', None, [])
 mod.add_function('DecRef', None, [param('int64_t', 'handle')])
 mod.add_function('IncRef', None, [param('int64_t', 'handle')])
 mod.add_function('NumHandles', retval('int'), [])
+mod.add_function('RunGC', None, [])
 mod.add_function('_gopy_clear_go_tls', None, [])
 `
 
@@ -318,6 +329,19 @@ else:
 if _gopy_saved_flags is not None:
 	sys.setdlopenflags(_gopy_saved_flags)
 os.chdir(cwd)
+# Run Go's GC whenever Python's GC runs so that Go-heap objects whose handles
+# were released via DecRef are promptly collected.  Without this, Go memory
+# can accumulate between Python gc.collect() calls because Python GC only
+# frees the Python wrapper; the underlying Go allocation is not reclaimed
+# until Go's own GC fires.
+try:
+	import gc as _gopy_gc
+	def _gopy_gc_cb(phase, info):
+		if phase == 'stop':
+			_%[1]s.RunGC()
+	_gopy_gc.callbacks.append(_gopy_gc_cb)
+except Exception:
+	pass
 
 # to use this code in your end-user python file, import it as follows:
 # from %[1]s import %[3]s
