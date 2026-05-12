@@ -149,13 +149,32 @@ func NumHandles() int {
 	return gopyh.NumHandles()
 }
 
-// RunGC runs the Go garbage collector.  gopy registers this as a Python
-// gc.callbacks handler so it fires automatically after each Python GC cycle,
-// keeping Go-heap objects freed via DecRef actually collected without any
-// user intervention.
-//export RunGC
-func RunGC() {
-	runtime.GC()
+// _gcReq carries GC requests from RequestGC (called on a CGo/needm M) to a
+// dedicated goroutine that actually calls runtime.GC().  Calling runtime.GC()
+// directly from the gc.callbacks context (a CGo-needm M) races with goroutines
+// mid-sweep on the same heap, causing "bad sweepgen in refill" panics on
+// multi-core machines.  Running GC on a proper goroutine eliminates that race.
+// RequestGC blocks until the GC cycle completes, so Python memory measurements
+// taken immediately after gc.collect() see the reclaimed Go memory.
+var _gcReq = make(chan chan struct{})
+
+func init() {
+	go func() {
+		for done := range _gcReq {
+			runtime.GC()
+			close(done)
+		}
+	}()
+}
+
+// RequestGC runs Go's garbage collector synchronously and safely.
+// gopy registers this via Python gc.callbacks so it fires after each Python
+// GC cycle, keeping Go-heap objects freed via DecRef promptly collected.
+//export RequestGC
+func RequestGC() {
+	done := make(chan struct{})
+	_gcReq <- done
+	<-done
 }
 
 // boolGoToPy converts a Go bool to python-compatible C.char
@@ -285,7 +304,7 @@ mod.add_function('GoPyInit', None, [])
 mod.add_function('DecRef', None, [param('int64_t', 'handle')])
 mod.add_function('IncRef', None, [param('int64_t', 'handle')])
 mod.add_function('NumHandles', retval('int'), [])
-mod.add_function('RunGC', None, [])
+mod.add_function('RequestGC', None, [])
 mod.add_function('_gopy_clear_go_tls', None, [])
 `
 
@@ -338,7 +357,7 @@ try:
 	import gc as _gopy_gc
 	def _gopy_gc_cb(phase, info):
 		if phase == 'stop':
-			_%[1]s.RunGC()
+			_%[1]s.RequestGC()
 	_gopy_gc.callbacks.append(_gopy_gc_cb)
 except Exception:
 	pass
